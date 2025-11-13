@@ -34,7 +34,12 @@ pub enum ZombieInfo {
     /// Process exited normally with exit code
     Exited(i32),
     /// Process was terminated by signal
-    Signaled { signal: i32, core_dumped: bool },
+    Signaled {
+        /// The signal number that terminated the process
+        signal: i32,
+        /// Whether the process produced a core dump, unimplemented for now
+        core_dumped: bool,
+    },
 }
 
 /// A process.
@@ -218,9 +223,13 @@ impl Process {
     pub fn zombie_info(&self) -> Option<ZombieInfo> {
         match *self.state.lock() {
             ProcessState::ZombieExited { exit_code } => Some(ZombieInfo::Exited(exit_code)),
-            ProcessState::ZombieSignaled { signal, core_dumped } => {
-                Some(ZombieInfo::Signaled { signal, core_dumped })
-            }
+            ProcessState::ZombieSignaled {
+                signal,
+                core_dumped,
+            } => Some(ZombieInfo::Signaled {
+                signal,
+                core_dumped,
+            }),
             _ => None,
         }
     }
@@ -230,7 +239,7 @@ impl Process {
         matches!(*self.state.lock(), ProcessState::Stopped { .. })
     }
 
-    /// Returns `true` if the [`Process`] is in continued state 
+    /// Returns `true` if the [`Process`] is in continued state
     /// (waiting for parent to acknowledge).
     pub fn is_continued(&self) -> bool {
         matches!(*self.state.lock(), ProcessState::Continued)
@@ -308,7 +317,10 @@ impl Process {
         }
 
         let mut children = self.children.lock(); // Acquire the lock first
-        *self.state.lock() = ProcessState::ZombieSignaled { signal, core_dumped };
+        *self.state.lock() = ProcessState::ZombieSignaled {
+            signal,
+            core_dumped,
+        };
 
         let mut reaper_children = reaper.children.lock();
         let reaper = Arc::downgrade(reaper);
