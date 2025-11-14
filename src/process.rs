@@ -53,6 +53,11 @@ pub struct Process {
     parent: SpinNoIrq<Weak<Process>>,
 
     group: SpinNoIrq<Arc<ProcessGroup>>,
+
+    /// Tracks if process was continued but parent hasn't acknowledged via waitpid(WCONTINUED)
+    /// This flag persists even after the process exits, allowing WCONTINUED to be reported
+    /// for processes that were continued and then immediately exited.
+    continued_unacknowledged: SpinNoIrq<bool>,
 }
 
 impl Process {
@@ -241,8 +246,13 @@ impl Process {
 
     /// Returns `true` if the [`Process`] is in continued state
     /// (waiting for parent to acknowledge).
+    ///
+    /// This returns true if either:
+    /// - The process is currently in Continued state, OR
+    /// - The process has an unacknowledged continuation (even if it exited)
     pub fn is_continued(&self) -> bool {
         matches!(*self.state.lock(), ProcessState::Continued)
+            || *self.continued_unacknowledged.lock()
     }
 
     /// Stops the [`Process`] by a signal.
@@ -255,16 +265,21 @@ impl Process {
         let mut state = self.state.lock();
         if matches!(*state, ProcessState::Stopped { .. }) {
             *state = ProcessState::Continued;
+            // Mark that continuation hasn't been acknowledged yet
+            *self.continued_unacknowledged.lock() = true;
         }
     }
 
     /// Acknowledges that the continued state has been reported to parent.
-    /// Transitions from Continued to Running.
+    /// Transitions from Continued to Running and clears the unacknowledged flag.
     pub fn ack_continued(&self) {
         let mut state = self.state.lock();
         if matches!(*state, ProcessState::Continued) {
             *state = ProcessState::Running;
         }
+        // Clear the unacknowledged flag regardless of current state
+        // (allows acknowledgement even if process already exited)
+        *self.continued_unacknowledged.lock() = false;
     }
 
     /// Obtain the signal that stopped the [`Process`], if it is stopped.
@@ -382,6 +397,7 @@ impl Process {
             children: SpinNoIrq::new(StrongMap::new()),
             parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
             group: SpinNoIrq::new(group.clone()),
+            continued_unacknowledged: SpinNoIrq::new(false),
         });
 
         group.processes.lock().insert(pid, &process);
