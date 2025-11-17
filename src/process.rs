@@ -8,6 +8,7 @@ use core::fmt;
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
 use weak_map::StrongMap;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Pid, ProcessGroup, Session};
 
