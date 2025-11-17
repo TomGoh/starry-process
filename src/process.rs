@@ -3,10 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{
-    fmt,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::fmt;
 
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
@@ -297,7 +294,7 @@ impl Process {
         self.continued_unacked.store(false, Ordering::Release);
     }
 
-    /// Terminates the [`Process`], marking it as a zombie process.
+    /// Terminates the [`Process`] normally, marking it as a zombie process.
     ///
     /// Child processes are inherited by the init process or by the nearest
     /// subreaper process.
