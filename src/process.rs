@@ -1,13 +1,88 @@
+//! Process state management implementation.
+//!
+//! # Architecture Overview
+//!
+//! This module implements a composite process state machine that tracks both
+//! the primary lifecycle state of a process and auxiliary event flags for
+//! parent notification via `waitpid`.
+//!
+//! ## State Model
+//!
+//! The process state is represented by two components:
+//!
+//! 1. **`ProcessStateKind`** - The primary lifecycle state:
+//!    - `Running`: Process is executing or ready to execute.
+//!    - `Stopped`: Process is stopped by a signal or ptrace.
+//!    - `Zombie`: Process has terminated but not yet been reaped.
+//!
+//! 2. **`ProcessStateFlags`** - Event acknowledgement flags:
+//!    - `STOPPED_UNACKED`: A stop event has occurred but not yet reported to
+//!      parent.
+//!    - `CONTINUED_UNACKED`: A continuation event has occurred but not yet
+//!      reported to parent.
+//!
+//! These are combined in the `ProcessState` struct, which encapsulates all
+//! state transitions and ensures invariants are maintained.
+//!
+//! ## State Transitions
+//!
+//! State transitions are managed through explicit methods on `ProcessState`:
+//!
+//! - `transition_to_stopped(signal, ptraced)`: `Running` → `Stopped` +
+//!   `STOPPED_UNACKED`
+//! - `transition_to_running()`: `Stopped` → `Running` + `CONTINUED_UNACKED`
+//! - `transition_to_zombie(info)`: Any state → `Zombie` (clears all flags)
+//!
+//! ### Important Invariants
+//!
+//! - A `Zombie` process cannot transition to any other state.
+//! - The `CONTINUED_UNACKED` flag is only valid when `kind` is `Running`.
+//! - The `STOPPED_UNACKED` flag is only valid when `kind` is `Stopped`.
+//! - Flags are automatically set during transitions and consumed atomically by
+//!   `waitpid`.
+//!
+//! ## Interaction with `waitpid`
+//!
+//! Parent processes use `waitpid` with options like `WUNTRACED` and
+//! `WCONTINUED` to wait for child state changes. The event consumption flow is:
+//!
+//! 1. Child transitions (e.g., `Running` → `Stopped`), setting the
+//!    corresponding flag.
+//! 2. Parent calls `waitpid(WUNTRACED)`, which internally calls
+//!    `try_consume_stopped()`.
+//! 3. `try_consume_stopped()` atomically checks and clears the
+//!    `STOPPED_UNACKED` flag.
+//! 4. If successful, the event is reported exactly once to the parent.
+//!
+//! This ensures that each state change event is reported exactly once,
+//! preventing duplicate notifications and race conditions.
+//!
+//! ## Thread Safety
+//!
+//! The `ProcessState` is protected by a `SpinNoIrq` lock within the `Process`
+//! struct. All state queries and transitions must acquire this lock, ensuring
+//! atomic updates even in concurrent scenarios (e.g., signal delivery while
+//! parent is waiting).
+//!
+//! ## Ptrace Integration
+//!
+//! Ptrace stops are represented as `Stopped { ptraced: true, signal }`. They
+//! differ from signal-stops in key ways:
+//!
+//! - Ptrace stops are NOT consumed by standard `waitpid(WUNTRACED)` calls.
+//! - They are handled separately via `check_ptrace_stop()` in the ptrace
+//!   subsystem.
+//! - Resuming from ptrace stops goes directly to `Running` (no `CONTINUED`
+//!   event).
+
 use alloc::{
     collections::btree_set::BTreeSet,
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{
-    fmt,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::fmt;
 
+use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
 use weak_map::StrongMap;
@@ -21,43 +96,80 @@ pub(crate) struct ThreadGroup {
     pub(crate) group_exited: bool,
 }
 
-/// Store basic information about a zombie process
+/// The primary lifecycle state of the process.
+///
+/// We create three states for process, `Running`, `Stopped`, and `Zombie`.
+///
+/// For a `Running` process, it can be actually running(if the
+/// `ProcessStateFlags` is empty) or it can be just `Continued` from a stoppage
+/// but not acked by its parent(if the `ProcessStateFlags` contain
+/// `CONTINUED_UNACKED`).
+///
+/// For a `Stopped` process, if its stoppage has not been acked by its parent,
+/// i.e., the parent has not been notified for the child's stoppade, the
+/// corresponding `ProcessStateFlags` will be marked as `STOPPED_UNACKED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStateKind {
+    Running,
+    Stopped { signal: i32, ptraced: bool },
+    Zombie { info: ZombieInfo },
+}
+
+bitflags! {
+    /// Composite flags for process state (e.g., reporting status).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ProcessStateFlags: u8 {
+        // A status of a process who has stopped but its stoppage
+        // has not been acked by its parent
+        const STOPPED_UNACKED = 1 << 0;
+        // A status of a process who has just continued but its continuation
+        // has not been acked by its parent
+        const CONTINUED_UNACKED = 1 << 1;
+    }
+}
+
+/// The exit code value following POSIX conventions.
+///
+/// This type encapsulates the numeric exit code that is reported to the parent
+/// process via `waitpid`. The encoding follows POSIX standards:
+/// - Normal exit: Exit code 0-255 directly
+/// - Signal termination: Exit code = 128 + signal number
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitCode(i32);
+
+impl ExitCode {
+    /// Creates an exit code from a normal exit.
+    pub fn from_code(code: i32) -> Self {
+        Self(code)
+    }
+
+    /// Creates an exit code from signal termination (128 + signal).
+    pub fn from_signal(signal: i32) -> Self {
+        Self(128 + signal)
+    }
+
+    /// Returns the raw exit code value.
+    pub fn as_raw(self) -> i32 {
+        self.0
+    }
+}
+
+/// Information about a zombie (terminated) process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZombieInfo {
-    /// exit_code of the process
-    pub exit_code: i32,
-    /// signal that terminates the process if any, an option field
+    /// The exit code value.
+    pub exit_code: ExitCode,
+    /// The signal that terminated the process, if any.
     pub signal: Option<i32>,
-    /// indicator of any core_dump
-    /// currently a placeholder, unimplemented
+    /// Whether a core dump was produced.
     pub core_dumped: bool,
 }
 
-/// Process State during the entire lifecycle
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessState {
-    /// State for process just inited or actually executing
-    Running,
-    /// State for signal-stopped process, including both signal-stops and ptrace-stops
-    Stopped {
-        /// Signal number for reporting to parent/tracer.
-        /// For signal-stops: actual signal (SIGSTOP=19, SIGTSTP=20, etc.)
-        /// For ptrace-stops: SIGTRAP=5 (or with 0x80 for syscall-stops)
-        signal: i32,
-
-        /// Whether this is a ptrace-stop (vs signal-stop).
-        /// - signal-stops: visible to parent via waitpid(WUNTRACED)
-        /// - ptrace-stops: only visible to tracer
-        /// - SIGCONT resumes signal-stops but NOT ptrace-stops
-        is_ptrace_stopped: bool,
-    },
-    /// State for process just continued but whose parent has not been notified
-    Continued,
-    /// State for process just finished executing
-    Zombie {
-        /// Relative info of the zombie process
-        info: ZombieInfo
-    },
+/// The full process state machine.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessState {
+    kind: ProcessStateKind,
+    flags: ProcessStateFlags,
 }
 
 /// A process.
@@ -71,8 +183,6 @@ pub struct Process {
     parent: SpinNoIrq<Weak<Process>>,
 
     group: SpinNoIrq<Arc<ProcessGroup>>,
-    continued_unacked: AtomicBool,
-    stopped_unacked: AtomicBool,
 }
 
 impl Process {
@@ -232,12 +342,12 @@ impl Process {
 impl Process {
     /// Returns `true` if the [`Process`] is a zombie process.
     pub fn is_zombie(&self) -> bool {
-        matches!(*self.state.lock(), ProcessState::Zombie { .. })
+        self.state.lock().is_zombie()
     }
 
     /// Get the information of the process ig it is a zombie
     pub fn get_zombie_info(&self) -> Option<ZombieInfo> {
-        if let ProcessState::Zombie { info } = *self.state.lock() {
+        if let ProcessStateKind::Zombie { info } = self.state.lock().kind {
             Some(info)
         } else {
             None
@@ -245,68 +355,72 @@ impl Process {
     }
 
     /// Check whether the process has stopped,
-    /// including both the case which the process just stopped without acked by its parent
-    /// and already acked by its parent
+    /// including both the case which the process just stopped without acked by
+    /// its parent and already acked by its parent
     pub fn is_stopped(&self) -> bool {
-        matches!(*self.state.lock(), ProcessState::Stopped { .. }) || self.stopped_unacked.load(Ordering::Acquire)
-    }
-
-    /// A real-time quick snapshot of the process's state
-    pub fn state_snapshot(&self) -> ProcessState {
-        *self.state.lock()
-    }
-
-    /// Check whether the process's Stoppage has been acked by its parent
-    pub fn stopped_unacked(&self) -> bool {
-        self.stopped_unacked.load(Ordering::Acquire)
-    }
-
-    /// Set the process to be stopped with the corresponding signal
-    pub fn set_stopped_by_signal(&self, signal: i32) {
-        *self.state.lock() = ProcessState::Stopped { signal, is_ptrace_stopped: false };
-        self.stopped_unacked.store(true, Ordering::Release);
-    }
-
-    /// Get the stop signal if the process is in any stopped state.
-    ///
-    /// # Returns
-    /// * `Some(signal)` if process is stopped (signal-stop or ptrace-stop)
-    /// * `None` if process is running, continued, or zombie
-    pub fn get_stop_signal(&self) -> Option<i32> {
-        match *self.state.lock() {
-            ProcessState::Stopped { signal, .. } => Some(signal),
-            _ => None,
-        }
-    }
-
-    /// Set the stoppage of the process has been acked by its parent
-    pub fn ack_stopped(&self) {
-        self.stopped_unacked.store(false, Ordering::Release);
+        let state = self.state.lock();
+        matches!(state.kind, ProcessStateKind::Stopped { .. })
+            || state.flags.contains(ProcessStateFlags::STOPPED_UNACKED)
     }
 
     /// Check whether the process has continued from the stoppage,
-    /// including both the case which the process just continued without acked by its parent
-    /// and already acked by its parent
+    /// including both the case which the process just continued without acked
+    /// by its parent and already acked by its parent
     pub fn is_continued(&self) -> bool {
-        matches!(*self.state.lock(), ProcessState::Continued) || self.continued_unacked.load(Ordering::Acquire)
+        let state = self.state.lock();
+        matches!(state.kind, ProcessStateKind::Running)
+            && state.flags.contains(ProcessStateFlags::CONTINUED_UNACKED)
     }
 
-    /// Updating the status of a process continued from stoppage 
+    /// Updating the status of a process continued from stoppage
     pub fn continue_from_stop(&self) {
-        let mut state = self.state.lock();
-        if matches!(*state, ProcessState::Stopped { .. }) {
-            *state = ProcessState::Continued;
-            self.continued_unacked.store(true, Ordering::Release);
-        }
+        self.state.lock().transition_to_running();
     }
 
-    /// Update the statue of the process after its continuation has been acked by its parent
-    pub fn ack_continued(&self) {
+    /// Attempts to consume the 'continued' event for `waitpid(WCONTINUED)`.
+    ///
+    /// This is a thread-safe wrapper around
+    /// `ProcessState::try_consume_continued`. It acquires the state lock
+    /// and checks if the process has a pending continuation event.
+    ///
+    /// Returns `true` if the event was successfully consumed.
+    pub fn try_consume_continued(&self) -> bool {
+        self.state.lock().try_consume_continued()
+    }
+
+    /// Attempts to consume the 'stopped' event for `waitpid(WUNTRACED)`.
+    ///
+    /// This is a thread-safe wrapper around
+    /// `ProcessState::try_consume_stopped`. It acquires the state lock and
+    /// checks if the process has a pending stop event.
+    ///
+    /// IMPORTANT: This method explicitly ignores ptrace-stops. Ptrace stops are
+    /// handled separately via `check_ptrace_stop` and are not consumed by
+    /// standard `waitpid(WUNTRACED)` calls.
+    ///
+    /// Returns `Some(signal)` if the event was successfully consumed.
+    pub fn try_consume_stopped(&self) -> Option<i32> {
+        // Only consume if it's NOT a ptrace stop (for WUNTRACED)
         let mut state = self.state.lock();
-        if matches!(*state, ProcessState::Continued) {
-            *state = ProcessState::Running;
+        if matches!(state.kind, ProcessStateKind::Stopped { ptraced: true, .. }) {
+            return None;
         }
-        self.continued_unacked.store(false, Ordering::Release);
+        state.try_consume_stopped()
+    }
+
+    /// Transfers all children of this process to the init process (reaper).
+    ///
+    /// This is called when a process exits to ensure orphaned children are
+    /// reparented to init.
+    fn reaper_children(children: &mut StrongMap<Pid, Arc<Process>>) {
+        let reaper = INIT_PROC.get().unwrap();
+        let mut reaper_children = reaper.children.lock();
+        let reaper_weak = Arc::downgrade(reaper);
+
+        for (pid, child) in core::mem::take(children) {
+            *child.parent.lock() = reaper_weak.clone();
+            reaper_children.insert(pid, child);
+        }
     }
 
     /// Terminates the [`Process`], marking it as a zombie process.
@@ -323,26 +437,19 @@ impl Process {
             return;
         }
 
-        let mut children = self.children.lock(); // Acquire the lock first
-        let exit_code = self.tg.lock().exit_code;
-        *self.state.lock() = ProcessState::Zombie {
-            info: ZombieInfo {
-                exit_code,
-                signal: None,
-                core_dumped: false,
-            },
-        };
+        let mut children = self.children.lock();
+        let code = self.tg.lock().exit_code;
+        self.state.lock().transition_to_zombie(ZombieInfo {
+            exit_code: ExitCode::from_code(code),
+            signal: None,
+            core_dumped: false,
+        });
 
-        let mut reaper_children = reaper.children.lock();
-        let reaper = Arc::downgrade(reaper);
-
-        for (pid, child) in core::mem::take(&mut *children) {
-            *child.parent.lock() = reaper.clone();
-            reaper_children.insert(pid, child);
-        }
+        Self::reaper_children(&mut children);
     }
 
-    /// Terminates the [`Process`], marking it as a zombie process ONLY when the termination is due to a signal
+    /// Terminates the [`Process`], marking it as a zombie process ONLY when the
+    /// termination is due to a signal
     ///
     /// Child processes are inherited by the init process or by the nearest
     /// subreaper process.
@@ -355,23 +462,14 @@ impl Process {
             return;
         }
 
-        let mut children = self.children.lock(); // Acquire the lock first
-        let exit_code = 128 + signal;
-        *self.state.lock() = ProcessState::Zombie {
-            info: ZombieInfo {
-                exit_code,
-                signal: Some(signal),
-                core_dumped,
-            },
-        };
+        let mut children = self.children.lock();
+        self.state.lock().transition_to_zombie(ZombieInfo {
+            exit_code: ExitCode::from_signal(signal),
+            signal: Some(signal),
+            core_dumped,
+        });
 
-        let mut reaper_children = reaper.children.lock();
-        let reaper = Arc::downgrade(reaper);
-
-        for (pid, child) in core::mem::take(&mut *children) {
-            *child.parent.lock() = reaper.clone();
-            reaper_children.insert(pid, child);
-        }
+        Self::reaper_children(&mut children);
     }
 
     /// Frees a zombie [`Process`]. Removes it from the parent.
@@ -385,10 +483,10 @@ impl Process {
         }
     }
 
-    /// Stops the [`Process`], marking it as stopped when a signal stops it(majorly SIGSTOP)
+    /// Stops the [`Process`], marking it as stopped when a signal stops
+    /// it(majorly SIGSTOP)
     pub fn stop_by_signal(&self, stop_signal: i32) {
-        *self.state.lock() = ProcessState::Stopped { signal: stop_signal, is_ptrace_stopped: false };
-        self.stopped_unacked.store(true, Ordering::Release);
+        self.state.lock().transition_to_stopped(stop_signal, false);
     }
 
     /// Set the process to be stopped due to a ptrace event.
@@ -401,11 +499,7 @@ impl Process {
     /// # Arguments
     /// * `signal` - Signal to report via waitpid (SIGTRAP or actual signal)
     pub fn set_ptrace_stopped(&self, signal: i32) {
-        *self.state.lock() = ProcessState::Stopped {
-            signal,
-            is_ptrace_stopped: true,
-        };
-        self.stopped_unacked.store(true, Ordering::Release);
+        self.state.lock().transition_to_stopped(signal, true);
     }
 
     /// Check if the process is in a ptrace-stop state.
@@ -414,10 +508,8 @@ impl Process {
     /// * `true` if process is stopped due to ptrace
     /// * `false` if running, signal-stopped, continued, or zombie
     pub fn is_ptrace_stopped(&self) -> bool {
-        matches!(
-            *self.state.lock(),
-            ProcessState::Stopped { is_ptrace_stopped: true, .. }
-        )
+        let state = self.state.lock();
+        matches!(state.kind, ProcessStateKind::Stopped { ptraced: true, .. })
     }
 
     /// Check if the process is in a signal-stop state (not ptrace).
@@ -426,10 +518,8 @@ impl Process {
     /// * `true` if process is stopped due to signal (SIGSTOP, etc.)
     /// * `false` if running, ptrace-stopped, continued, or zombie
     pub fn is_signal_stopped(&self) -> bool {
-        matches!(
-            *self.state.lock(),
-            ProcessState::Stopped { is_ptrace_stopped: false, .. }
-        )
+        let state = self.state.lock();
+        matches!(state.kind, ProcessStateKind::Stopped { ptraced: false, .. })
     }
 
     /// Resume from ptrace-stop by transitioning back to Running state.
@@ -438,11 +528,7 @@ impl Process {
     /// Unlike signal-stops which go through Continued state, ptrace
     /// resumes directly to Running.
     pub fn resume_from_ptrace_stop(&self) {
-        let mut state = self.state.lock();
-        if matches!(*state, ProcessState::Stopped { is_ptrace_stopped: true, .. }) {
-            *state = ProcessState::Running;
-            self.stopped_unacked.store(false, Ordering::Release);
-        }
+        self.state.lock().transition_to_running();
     }
 }
 
@@ -480,13 +566,11 @@ impl Process {
 
         let process = Arc::new(Process {
             pid,
-            state: SpinNoIrq::new(ProcessState::Running),
+            state: SpinNoIrq::new(ProcessState::new_running()),
             tg: SpinNoIrq::new(ThreadGroup::default()),
             children: SpinNoIrq::new(StrongMap::new()),
             parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
             group: SpinNoIrq::new(group.clone()),
-            continued_unacked: AtomicBool::new(false),
-            stopped_unacked: AtomicBool::new(false),
         });
 
         group.processes.lock().insert(pid, &process);
@@ -521,4 +605,120 @@ static INIT_PROC: LazyInit<Arc<Process>> = LazyInit::new();
 /// This function panics if the init process has not been initialized yet.
 pub fn init_proc() -> Arc<Process> {
     INIT_PROC.get().unwrap().clone()
+}
+
+impl ProcessState {
+    /// Creates a new `ProcessState` in the Running state,
+    /// with its `kind` to be `ProcessStateKind::Running`,
+    /// and its `flags` to be empty.
+    pub fn new_running() -> Self {
+        Self {
+            kind: ProcessStateKind::Running,
+            flags: ProcessStateFlags::empty(),
+        }
+    }
+
+    /// Returns `true` if the state is Zombie.
+    pub fn is_zombie(&self) -> bool {
+        matches!(self.kind, ProcessStateKind::Zombie { .. })
+    }
+
+    /// Transitions the state to Stopped.
+    ///
+    /// This method updates the process state kind to `Stopped` with the
+    /// given signal and ptrace status. It also sets the `STOPPED_UNACKED`
+    /// flag, indicating that the parent has not yet acknowledged this stop
+    /// event (via `waitpid` with `WUNTRACED`).
+    ///
+    /// If the process is already a `Zombie`, this transition is ignored.
+    ///
+    /// # Arguments
+    /// * `signal` - The signal that caused the stop.
+    /// * `ptraced` - Whether the stop is due to ptrace.s
+    pub fn transition_to_stopped(&mut self, signal: i32, ptraced: bool) {
+        if self.is_zombie() {
+            return;
+        }
+
+        self.kind = ProcessStateKind::Stopped { signal, ptraced };
+        self.flags.insert(ProcessStateFlags::STOPPED_UNACKED);
+    }
+
+    /// Transitions the process state from `Stopped` to `Running`.
+    ///
+    /// This method is called when a stopped process is resumed (e.g., via
+    /// `SIGCONT` or `PTRACE_CONT`). It updates the state kind to `Running`
+    /// and sets the `CONTINUED_UNACKED` flag, indicating that the parent
+    /// has not yet acknowledged this continuation (via `waitpid` with
+    /// `WCONTINUED`).
+    ///
+    /// It also clears the `STOPPED_UNACKED` flag, as the process is no longer
+    /// stopped, even if the parent may not be aware that there is a
+    /// stop-continue event happened.
+    ///
+    /// If the process is not currently `Stopped`, this method does nothing.
+    pub fn transition_to_running(&mut self) {
+        if let ProcessStateKind::Stopped { .. } = self.kind {
+            self.kind = ProcessStateKind::Running;
+            self.flags.insert(ProcessStateFlags::CONTINUED_UNACKED);
+            self.flags.remove(ProcessStateFlags::STOPPED_UNACKED);
+        }
+    }
+
+    /// Transitions the process state to `Zombie`.
+    ///
+    /// This method is called when the process terminates. It updates the state
+    /// kind to `Zombie`, no matter what the previous state of the target
+    /// process is at.
+    ///
+    /// All state flags (e.g., `STOPPED_UNACKED`, `CONTINUED_UNACKED`) are
+    /// cleared, as they are no longer relevant for a dead process.
+    pub fn transition_to_zombie(&mut self, info: ZombieInfo) {
+        self.kind = ProcessStateKind::Zombie { info };
+        self.flags = ProcessStateFlags::empty();
+    }
+
+    /// Attempts to consume the 'stopped' event for `waitpid(WUNTRACED)`.
+    ///
+    /// This method checks if the process is in the `Stopped` state and if the
+    /// `STOPPED_UNACKED` flag is set. If both are true, it:
+    /// 1. Clears the `STOPPED_UNACKED` flag (atomically consuming the event).
+    /// 2. Returns `Some(signal)` where `signal` is the signal that caused the
+    ///    stop.
+    ///
+    /// If the process is not stopped, or if the event has already been consumed
+    /// (flag is clear), it returns `None`.
+    ///
+    /// This ensures that a stop event is reported exactly once to a parent
+    /// calling `waitpid`.
+    pub fn try_consume_stopped(&mut self) -> Option<i32> {
+        if self.flags.contains(ProcessStateFlags::STOPPED_UNACKED) {
+            if let ProcessStateKind::Stopped { signal, .. } = self.kind {
+                self.flags.remove(ProcessStateFlags::STOPPED_UNACKED);
+                return Some(signal);
+            }
+        }
+        None
+    }
+
+    /// Attempts to consume the 'continued' event for `waitpid(WCONTINUED)`.
+    ///
+    /// This method checks if the process is in the `Running` state (which
+    /// implies it might have been continued) and if the `CONTINUED_UNACKED`
+    /// flag is set. If both are true, it:
+    /// 1. Clears the `CONTINUED_UNACKED` flag (atomically consuming the event).
+    /// 2. Returns `true`.
+    ///
+    /// If the process is not running, or if the event has already been consumed
+    /// (flag is clear), it returns `false`.
+    ///
+    /// This ensures that a continuation event is reported exactly once to a
+    /// parent calling `waitpid`.
+    pub fn try_consume_continued(&mut self) -> bool {
+        if self.flags.contains(ProcessStateFlags::CONTINUED_UNACKED) {
+            self.flags.remove(ProcessStateFlags::CONTINUED_UNACKED);
+            return true;
+        }
+        false
+    }
 }
