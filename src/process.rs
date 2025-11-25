@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2025 KylinSoft Co., Ltd. https://www.kylinos.cn/
-// Copyright (C) 2025 Azure-stars Azure_stars@126.com
+// Copyright (C) 2025 朝倉水希 asakuramizu111@gmail.com
 // See LICENSES for license details.
 
 //! Process state management implementation.
@@ -105,13 +105,13 @@ pub(crate) struct ThreadGroup {
 ///
 /// We create three states for process, `Running`, `Stopped`, and `Zombie`.
 ///
-/// For a `Running` process, it can be actually running(if the
+/// For a `Running` process, it can be actually running (if the
 /// `ProcessStateFlags` is empty) or it can be just `Continued` from a stoppage
-/// but not acked by its parent(if the `ProcessStateFlags` contain
+/// but not acked by its parent (if the `ProcessStateFlags` contain
 /// `CONTINUED_UNACKED`).
 ///
 /// For a `Stopped` process, if its stoppage has not been acked by its parent,
-/// i.e., the parent has not been notified for the child's stoppade, the
+/// i.e., the parent has not been notified for the child's stoppage, the
 /// corresponding `ProcessStateFlags` will be marked as `STOPPED_UNACKED`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStateKind {
@@ -350,7 +350,7 @@ impl Process {
         self.state.lock().is_zombie()
     }
 
-    /// Get the information of the process ig it is a zombie
+    /// Get the information of the process if it is a zombie
     pub fn get_zombie_info(&self) -> Option<ZombieInfo> {
         if let ProcessStateKind::Zombie { info } = self.state.lock().kind {
             Some(info)
@@ -365,12 +365,10 @@ impl Process {
     pub fn is_stopped(&self) -> bool {
         let state = self.state.lock();
         matches!(state.kind, ProcessStateKind::Stopped { .. })
-            || state.flags.contains(ProcessStateFlags::STOPPED_UNACKED)
     }
 
     /// Check whether the process has continued from the stoppage,
-    /// including both the case which the process just continued without acked
-    /// by its parent and already acked by its parent
+    /// but its continuation has not been acked by its parent
     pub fn is_continued(&self) -> bool {
         let state = self.state.lock();
         matches!(state.kind, ProcessStateKind::Running)
@@ -639,7 +637,7 @@ impl ProcessState {
     ///
     /// # Arguments
     /// * `signal` - The signal that caused the stop.
-    /// * `ptraced` - Whether the stop is due to ptrace.s
+    /// * `ptraced` - Whether the stop is due to ptrace.
     pub fn transition_to_stopped(&mut self, signal: i32, ptraced: bool) {
         if self.is_zombie() {
             return;
