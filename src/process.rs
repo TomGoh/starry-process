@@ -133,37 +133,11 @@ bitflags! {
     }
 }
 
-/// The exit code value following POSIX conventions.
-///
-/// This type encapsulates the numeric exit code that is reported to the parent
-/// process via `waitpid`. The encoding follows POSIX standards:
-/// - Normal exit: Exit code 0-255 directly
-/// - Signal termination: Exit code = 128 + signal number
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExitCode(i32);
-
-impl ExitCode {
-    /// Creates an exit code from a normal exit.
-    pub fn from_code(code: i32) -> Self {
-        Self(code)
-    }
-
-    /// Creates an exit code from signal termination (128 + signal).
-    pub fn from_signal(signal: i32) -> Self {
-        Self(128 + signal)
-    }
-
-    /// Returns the raw exit code value.
-    pub fn as_raw(self) -> i32 {
-        self.0
-    }
-}
-
 /// Information about a zombie (terminated) process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZombieInfo {
-    /// The exit code value.
-    pub exit_code: ExitCode,
+    /// The exit code value passed to exit().
+    pub exit_code: i32,
     /// The signal that terminated the process, if any.
     pub signal: Option<i32>,
     /// Whether a core dump was produced.
@@ -178,6 +152,8 @@ pub struct ProcessState {
 }
 
 /// A process.
+// TODO: Optimize Process struct for dead processes (fat zombie now).
+// TODO: O(N) wait: Polling children is inefficient. May Use WaitQueue.
 pub struct Process {
     pid: Pid,
     state: SpinNoIrq<ProcessState>,
@@ -375,6 +351,12 @@ impl Process {
             && state.flags.contains(ProcessStateFlags::CONTINUED_UNACKED)
     }
 
+    /// Returns the POSIX wait status word for the current state if there is a
+    /// reportable event.
+    pub fn wait_status(&self) -> Option<i32> {
+        self.state.lock().wait_status()
+    }
+
     /// Updating the status of a process continued from stoppage
     pub fn continue_from_stop(&self) {
         self.state.lock().transition_to_running(true);
@@ -415,6 +397,7 @@ impl Process {
     ///
     /// This is called when a process exits to ensure orphaned children are
     /// reparented to init.
+    // TODO: Reparenting is O(N) and locks global init.
     fn reaper_children(children: &mut StrongMap<Pid, Arc<Process>>) {
         let reaper = INIT_PROC.get().unwrap();
         let mut reaper_children = reaper.children.lock();
@@ -441,9 +424,11 @@ impl Process {
         }
 
         let mut children = self.children.lock();
+        // We now simply save the exit code and signal,
+        // and let the wait system call handle the rest
         let code = self.tg.lock().exit_code;
         self.state.lock().transition_to_zombie(ZombieInfo {
-            exit_code: ExitCode::from_code(code),
+            exit_code: code,
             signal: None,
             core_dumped: false,
         });
@@ -464,10 +449,12 @@ impl Process {
         if Arc::ptr_eq(self, reaper) {
             return;
         }
-
+        // We now simply save the exit code and signal,
+        // and let the wait system call handle the rest
+        let code = self.tg.lock().exit_code;
         let mut children = self.children.lock();
         self.state.lock().transition_to_zombie(ZombieInfo {
-            exit_code: ExitCode::from_signal(signal),
+            exit_code: code,
             signal: Some(signal),
             core_dumped,
         });
@@ -728,5 +715,38 @@ impl ProcessState {
             return true;
         }
         false
+    }
+
+    /// Returns the POSIX wait status word for the current state if there is a
+    /// reportable event.
+    ///
+    /// - Stopped + STOPPED_UNACKED: Returns `(signal << 8) | 0x7f`
+    /// - Running + CONTINUED_UNACKED: Returns `0xffff`
+    /// - Zombie: Returns encoded exit status per POSIX
+    /// - Otherwise: Returns `None`
+    pub fn wait_status(&self) -> Option<i32> {
+        match self.kind {
+            ProcessStateKind::Stopped { signal, .. }
+                if self.flags.contains(ProcessStateFlags::STOPPED_UNACKED) =>
+            {
+                Some((signal << 8) | 0x7f)
+            }
+            ProcessStateKind::Running
+                if self.flags.contains(ProcessStateFlags::CONTINUED_UNACKED) =>
+            {
+                Some(0xffff)
+            }
+            ProcessStateKind::Zombie { info } => {
+                if let Some(sig) = info.signal {
+                    // WIFSIGNALED: Bits 0-6 are signal, Bit 7 is core dump.
+                    let core_bit = if info.core_dumped { 0x80 } else { 0 };
+                    Some((sig & 0x7f) | core_bit)
+                } else {
+                    // WIFEXITED: Bits 8-15 are exit code.
+                    Some((info.exit_code & 0xff) << 8)
+                }
+            }
+            _ => None,
+        }
     }
 }

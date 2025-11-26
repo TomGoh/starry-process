@@ -19,6 +19,8 @@ fn exit() {
     let child = parent.new_child();
     child.exit();
     assert!(child.is_zombie());
+    // Normal exit with code 0 -> status 0
+    assert_eq!(child.wait_status(), Some(0));
     assert!(parent.children().iter().any(|c| Arc::ptr_eq(c, &child)));
 }
 
@@ -69,7 +71,10 @@ fn thread_exit() {
 
     let last2 = child.exit_thread(102, 3);
     assert!(last2);
+    child.exit();
     assert_eq!(child.exit_code(), 7);
+    // Exit code 7 -> status (7 << 8) = 0x0700
+    assert_eq!(child.wait_status(), Some(0x0700));
 }
 
 #[test]
@@ -90,6 +95,8 @@ fn test_stop_continue_integration() {
     assert!(!child.is_ptrace_stopped());
 
     // Consume stopped event
+    // POSIX stopped status: (sig << 8) | 0x7f
+    assert_eq!(child.wait_status(), Some((sig_stop << 8) | 0x7f));
     assert_eq!(child.try_consume_stopped(), Some(sig_stop));
 
     // Should be consumed now (still stopped, but event consumed)
@@ -103,6 +110,8 @@ fn test_stop_continue_integration() {
     assert!(child.is_continued());
 
     // Consume continued event
+    // POSIX continued status: 0xffff
+    assert_eq!(child.wait_status(), Some(0xffff));
     assert!(child.try_consume_continued());
 
     // Should be consumed now
@@ -147,6 +156,11 @@ fn test_exit_signal_integration() {
 
     let info = child.get_zombie_info().expect("Should have zombie info");
     assert_eq!(info.signal, Some(sig_kill));
-    assert_eq!(info.exit_code.as_raw(), 128 + sig_kill);
+    assert_eq!(info.exit_code, 0); // Exit code is 0 for signal termination
     assert!(!info.core_dumped);
+
+    // Verify POSIX wait status manufacturing
+    let status = child.wait_status().expect("Should have wait status");
+    assert_eq!(status & 0x7f, sig_kill);
+    assert_eq!(status & 0x80, 0); // No core dump
 }
