@@ -5,9 +5,10 @@ use alloc::{
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
+use bitflags::bitflags;
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
 use weak_map::StrongMap;
@@ -21,10 +22,31 @@ pub(crate) struct ThreadGroup {
     pub(crate) group_exited: bool,
 }
 
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) struct ProcessState: u8 {
+        const RUNNING = 1 << 0;
+        const STOPPED = 1 << 1;
+        const ZOMBIE  = 1 << 2;
+    }
+}
+
+impl PartialEq<u8> for ProcessState {
+    fn eq(&self, other: &u8) -> bool {
+        self.bits() == *other
+    }
+}
+
+impl PartialEq<ProcessState> for u8 {
+    fn eq(&self, other: &ProcessState) -> bool {
+        *self == other.bits()
+    }
+}
+
 /// A process.
 pub struct Process {
     pid: Pid,
-    is_zombie: AtomicBool,
+    state: AtomicU8,
     pub(crate) tg: SpinNoIrq<ThreadGroup>,
 
     // TODO: child subreaper9
@@ -191,7 +213,64 @@ impl Process {
 impl Process {
     /// Returns `true` if the [`Process`] is a zombie process.
     pub fn is_zombie(&self) -> bool {
-        self.is_zombie.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == ProcessState::ZOMBIE
+    }
+
+    /// Returns `true` if the [`Process`] is running.
+    pub fn is_running(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ProcessState::RUNNING
+    }
+
+    ///  Returns `true` if the [`Process`] is stopped.
+    pub fn is_stopped(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ProcessState::STOPPED
+    }
+
+    /// Change the [`Process`] from Running to `Stopped` with a causing signal.
+    ///
+    /// This method checks for the process state atomically first using the CAS
+    /// `fetch_update`, ensuring only the state has successfully changed
+    /// into `STOPPED` or not changed.
+    pub fn transition_to_stopped(&self) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
+                if curr == ProcessState::ZOMBIE.bits() {
+                    None
+                } else {
+                    Some(ProcessState::STOPPED.bits())
+                }
+            });
+    }
+
+    /// Change the [`Process`] from `Stopped` to `Running`.
+    ///
+    /// Since the only signal that can trigger this state change is `SIGCONT`,
+    /// we omit the signal here.
+    ///
+    /// This method checks for the process state atomically first using the CAS
+    /// `fetch_update`, ensuring only the state has successfully changed
+    /// into `RUNNING` or not changed.
+    pub fn transition_to_running(&self) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
+                if curr != ProcessState::STOPPED {
+                    None
+                } else {
+                    Some(ProcessState::RUNNING.bits())
+                }
+            });
+    }
+
+    /// Change the [`Process`] from `Stopped` or `Running` to `Zombie`.
+    pub fn transition_to_zombie(&self) {
+        if self.is_zombie() {
+            return;
+        }
+
+        self.state
+            .store(ProcessState::ZOMBIE.bits(), Ordering::Relaxed);
     }
 
     /// Terminates the [`Process`], marking it as a zombie process.
@@ -209,7 +288,7 @@ impl Process {
         }
 
         let mut children = self.children.lock(); // Acquire the lock first
-        self.is_zombie.store(true, Ordering::Release);
+        self.transition_to_zombie();
 
         let mut reaper_children = reaper.children.lock();
         let reaper = Arc::downgrade(reaper);
@@ -266,7 +345,7 @@ impl Process {
 
         let process = Arc::new(Process {
             pid,
-            is_zombie: AtomicBool::new(false),
+            state: AtomicU8::new(ProcessState::RUNNING.bits()),
             tg: SpinNoIrq::new(ThreadGroup::default()),
             children: SpinNoIrq::new(StrongMap::new()),
             parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
