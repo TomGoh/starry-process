@@ -15,11 +15,27 @@ use weak_map::StrongMap;
 
 use crate::{Pid, ProcessGroup, Session};
 
-#[derive(Default)]
 pub(crate) struct ThreadGroup {
     pub(crate) threads: BTreeSet<Pid>,
     pub(crate) exit_code: i32,
     pub(crate) group_exited: bool,
+    /// Unreported stop/continue events for waitpid() with WUNTRACED/WCONTINUED.
+    /// Persists until the zombie is reaped.
+    wait_events: AtomicU8,
+    /// The signal number that most recently stopped the process.
+    last_stop_signal: AtomicU8,
+}
+
+impl Default for ThreadGroup {
+    fn default() -> Self {
+        Self {
+            threads: BTreeSet::new(),
+            exit_code: 0,
+            group_exited: false,
+            wait_events: AtomicU8::new(0),
+            last_stop_signal: AtomicU8::new(0),
+        }
+    }
 }
 
 bitflags! {
@@ -28,6 +44,14 @@ bitflags! {
         const RUNNING = 1 << 0;
         const STOPPED = 1 << 1;
         const ZOMBIE  = 1 << 2;
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) struct WaitEventFlags: u8 {
+        const PENDING_STOP_EVENT = 1 << 0;
+        const PENDING_CONT_EVENT = 1 << 1;
     }
 }
 
@@ -337,6 +361,91 @@ impl Process {
         if let Some(parent) = self.parent() {
             parent.children.lock().remove(&self.pid);
         }
+    }
+
+    /// Records a stop signal effect for waitpid reporting.
+    ///
+    /// Sets the PENDING_STOP_EVENT flag and records which signal caused the
+    /// stop. Atomically clears any pending continue event.
+    pub fn set_stop_signal(&self, signal: u8) {
+        let tg = self.tg.lock();
+        tg.last_stop_signal.store(signal, Ordering::Release);
+
+        // Atomically: clear CONT event, set STOP event
+        tg.wait_events.fetch_update(
+            Ordering::Release,
+            Ordering::Acquire,
+            |current_flags| {
+                Some(
+                    (current_flags & !WaitEventFlags::PENDING_CONT_EVENT.bits())
+                        | WaitEventFlags::PENDING_STOP_EVENT.bits(),
+                )
+            },
+        ).ok();
+    }
+
+    /// Records a continue signal effect for waitpid reporting.
+    ///
+    /// Sets the PENDING_CONT_EVENT flag and clears the recorded stop signal.
+    /// Atomically clears any pending stop event.
+    pub fn set_cont_signal(&self) {
+        let tg = self.tg.lock();
+        tg.last_stop_signal.store(0, Ordering::Release);
+
+        // Atomically: clear STOP event, set CONT event
+        tg.wait_events.fetch_update(
+            Ordering::Release,
+            Ordering::Acquire,
+            |current_flags| {
+                Some(
+                    (current_flags & !WaitEventFlags::PENDING_STOP_EVENT.bits())
+                        | WaitEventFlags::PENDING_CONT_EVENT.bits(),
+                )
+            },
+        ).ok();
+    }
+
+    /// Peeks at a pending stop signal event without consuming it.
+    ///
+    /// Returns the signal that caused the stop if there is an unreported stop event.
+    pub fn peek_pending_stop_event(&self) -> Option<u8> {
+        let tg = self.tg.lock();
+        let flags = tg.wait_events.load(Ordering::Acquire);
+
+        if (flags & WaitEventFlags::PENDING_STOP_EVENT.bits()) != 0 {
+            let signal = tg.last_stop_signal.load(Ordering::Acquire);
+            if signal != 0 { Some(signal) } else { None }
+        } else {
+            None
+        }
+    }
+
+    /// Consumes (clears) the pending stop signal event.
+    pub fn consume_stop_event(&self) {
+        let tg = self.tg.lock();
+        tg.last_stop_signal.store(0, Ordering::Release);
+        tg.wait_events.fetch_and(
+            !WaitEventFlags::PENDING_STOP_EVENT.bits(),
+            Ordering::Release,
+        );
+    }
+
+    /// Peeks at a pending continue signal event without consuming it.
+    ///
+    /// Returns true if there is an unreported continue event.
+    pub fn peek_pending_cont_event(&self) -> bool {
+        let tg = self.tg.lock();
+        let flags = tg.wait_events.load(Ordering::Acquire);
+        (flags & WaitEventFlags::PENDING_CONT_EVENT.bits()) != 0
+    }
+
+    /// Consumes (clears) the pending continue signal event.
+    pub fn consume_cont_event(&self) {
+        let tg = self.tg.lock();
+        tg.wait_events.fetch_and(
+            !WaitEventFlags::PENDING_CONT_EVENT.bits(),
+            Ordering::Release,
+        );
     }
 }
 
