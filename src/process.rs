@@ -23,23 +23,11 @@ pub(crate) struct ThreadGroup {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct ProcessState: u8 {
         const RUNNING = 1 << 0;
         const STOPPED = 1 << 1;
         const ZOMBIE  = 1 << 2;
-    }
-}
-
-impl PartialEq<u8> for ProcessState {
-    fn eq(&self, other: &u8) -> bool {
-        self.bits() == *other
-    }
-}
-
-impl PartialEq<ProcessState> for u8 {
-    fn eq(&self, other: &ProcessState) -> bool {
-        *self == other.bits()
     }
 }
 
@@ -213,17 +201,20 @@ impl Process {
 impl Process {
     /// Returns `true` if the [`Process`] is a zombie process.
     pub fn is_zombie(&self) -> bool {
-        self.state.load(Ordering::Acquire) == ProcessState::ZOMBIE
+        let bits = self.state.load(Ordering::Acquire);
+        ProcessState::from_bits_truncate(bits).contains(ProcessState::ZOMBIE)
     }
 
     /// Returns `true` if the [`Process`] is running.
     pub fn is_running(&self) -> bool {
-        self.state.load(Ordering::Acquire) == ProcessState::RUNNING
+        let bits = self.state.load(Ordering::Acquire);
+        ProcessState::from_bits_truncate(bits).contains(ProcessState::RUNNING)
     }
 
-    ///  Returns `true` if the [`Process`] is stopped.
+    /// Returns `true` if the [`Process`] is stopped.
     pub fn is_stopped(&self) -> bool {
-        self.state.load(Ordering::Acquire) == ProcessState::STOPPED
+        let bits = self.state.load(Ordering::Acquire);
+        ProcessState::from_bits_truncate(bits).contains(ProcessState::STOPPED)
     }
 
     /// Change the [`Process`] from Running to `Stopped`.
@@ -244,10 +235,13 @@ impl Process {
             Ordering::Release, // Success: synchronize with is_stopped()
             Ordering::Relaxed, // Failure: no synchronization needed
             |curr| {
-                if curr == ProcessState::ZOMBIE.bits() {
-                    None // Already zombie, don't transition
+                let mut flags = ProcessState::from_bits_truncate(curr);
+                if flags.contains(ProcessState::ZOMBIE) || !flags.contains(ProcessState::RUNNING) {
+                    None // Already zombie or not running, don't transition
                 } else {
-                    Some(ProcessState::STOPPED.bits())
+                    flags.remove(ProcessState::RUNNING);
+                    flags.insert(ProcessState::STOPPED);
+                    Some(flags.bits())
                 }
             },
         );
@@ -257,7 +251,7 @@ impl Process {
     ///
     /// This method atomically transitions the process state to RUNNING using
     /// CAS. The transition succeeds if and only if the current state is
-    /// `STOPPED`.
+    /// `STOPPED` and not `ZOMBIE`.
     ///
     /// # Memory Ordering
     ///
@@ -271,10 +265,13 @@ impl Process {
             Ordering::Release, // Success: synchronize with is_running()
             Ordering::Relaxed, // Failure: no synchronization needed
             |curr| {
-                if curr != ProcessState::STOPPED.bits() {
-                    None // Not stopped, don't transition
+                let mut flags = ProcessState::from_bits_truncate(curr);
+                if !flags.contains(ProcessState::STOPPED) || flags.contains(ProcessState::ZOMBIE) {
+                    None // Not stopped or already zombie, don't transition
                 } else {
-                    Some(ProcessState::RUNNING.bits())
+                    flags.remove(ProcessState::STOPPED);
+                    flags.insert(ProcessState::RUNNING);
+                    Some(flags.bits())
                 }
             },
         );
@@ -293,14 +290,18 @@ impl Process {
     /// the ZOMBIE state, it also observes all writes that happened before
     /// the transition, particularly the exit_code set by `exit_thread()`.
     pub fn transition_to_zombie(&self) {
-        if self.is_zombie() {
-            return;
-        }
-
-        self.state.store(
-            ProcessState::ZOMBIE.bits(),
-            Ordering::Release, // Synchronize with is_zombie()
-        );
+        let _ = self
+            .state
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |curr| {
+                let mut flags = ProcessState::from_bits_truncate(curr);
+                if flags.contains(ProcessState::ZOMBIE) {
+                    None // Already zombie
+                } else {
+                    flags.remove(ProcessState::RUNNING | ProcessState::STOPPED);
+                    flags.insert(ProcessState::ZOMBIE);
+                    Some(flags.bits())
+                }
+            });
     }
 
     /// Terminates the [`Process`].
