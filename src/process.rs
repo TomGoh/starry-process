@@ -217,7 +217,7 @@ impl Process {
         ProcessState::from_bits_truncate(bits).contains(ProcessState::STOPPED)
     }
 
-    /// Change the [`Process`] from Running to `Stopped`.
+    /// Change the [`Process`] from `Running` to `Stopped`.
     ///
     /// This method atomically transitions the process state to STOPPED using
     /// CAS, ensuring the state is either successfully changed or already in
@@ -277,7 +277,7 @@ impl Process {
         );
     }
 
-    /// Change the [`Process`] from `Stopped` or `Running` to `Zombie`.
+    /// Change the [`Process`] from any non-ZOMBIE state to `Zombie`.
     ///
     /// This is a terminal state transition - once a process becomes a zombie,
     /// it cannot transition to any other state (it can only be freed via
